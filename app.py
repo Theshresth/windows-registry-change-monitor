@@ -1,33 +1,45 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-import subprocess
-import sys
-from pathlib import Path
+import winreg
 import threading
 import queue
+import json
+from pathlib import Path
+from datetime import datetime
 
 PROJECT_DIR = Path(__file__).parent
-WATCHER = PROJECT_DIR / "autorun_watch.py"
+LOG_DIR = PROJECT_DIR / "logs"
+LOG_FILE = LOG_DIR / "lab_changes.jsonl"
+
+REG_PATH = r"Software\RegistryMonitorLab"
+TEST_VALUE = "DemoTest"
+POLL_INTERVAL = 2
 
 
 class RegistryMonitorApp:
     def __init__(self, root):
         self.root = root
-        self.root.title("Windows Registry Monitor")
-        self.root.geometry("720x480")
-        self.process = None
+        self.root.title("Windows Registry Change Monitor")
+        self.root.geometry("780x570")
+
+        self.running = False
+        self.stop_event = threading.Event()
         self.output_queue = queue.Queue()
+        self.monitor_thread = None
+        self.previous_state = {}
+
+        self.create_registry_key()
 
         ttk.Label(
             root,
             text="Windows Registry Change Monitor",
-            font=("Segoe UI", 17, "bold")
-        ).pack(pady=15)
+            font=("Segoe UI", 18, "bold")
+        ).pack(pady=12)
 
         ttk.Label(
             root,
-            text="Monitors startup registry entries in read-only mode."
-        ).pack()
+            text="Safe interactive testing: HKCU\\Software\\RegistryMonitorLab"
+        ).pack(pady=3)
 
         controls = ttk.Frame(root)
         controls.pack(pady=12)
@@ -40,20 +52,110 @@ class RegistryMonitorApp:
 
         self.stop_button = ttk.Button(
             controls, text="Stop Monitoring",
-            command=self.stop_monitoring, state="disabled"
+            command=self.stop_monitoring,
+            state="disabled"
         )
         self.stop_button.pack(side="left", padx=5)
 
+        ttk.Separator(root).pack(fill="x", padx=15, pady=8)
+
+        ttk.Label(
+            root,
+            text="Interactive Test Controls",
+            font=("Segoe UI", 12, "bold")
+        ).pack(pady=5)
+
+        test_controls = ttk.Frame(root)
+        test_controls.pack(pady=8)
+
+        ttk.Button(
+            test_controls, text="Add Test Value",
+            command=self.add_test_value
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            test_controls, text="Modify Test Value",
+            command=self.modify_test_value
+        ).pack(side="left", padx=5)
+
+        ttk.Button(
+            test_controls, text="Delete Test Value",
+            command=self.delete_test_value
+        ).pack(side="left", padx=5)
+
         self.status = tk.StringVar(value="Status: Stopped")
-        ttk.Label(root, textvariable=self.status).pack(pady=5)
+        ttk.Label(
+            root, textvariable=self.status,
+            font=("Segoe UI", 10, "bold")
+        ).pack(pady=5)
+
+        ttk.Label(
+            root, text="Monitoring Output",
+            font=("Segoe UI", 11, "bold")
+        ).pack(pady=5)
 
         self.output = tk.Text(root, wrap="word", height=17)
-        self.output.pack(fill="both", expand=True, padx=15, pady=10)
-        self.output.insert("end", "Ready. Click Start Monitoring.\n")
+        self.output.pack(fill="both", expand=True, padx=15, pady=8)
+
+        self.output.insert(
+            "end",
+            "Ready. Start monitoring, then use the test buttons.\n"
+        )
         self.output.configure(state="disabled")
 
         self.root.protocol("WM_DELETE_WINDOW", self.close_app)
         self.root.after(200, self.read_output)
+
+    def create_registry_key(self):
+        with winreg.CreateKeyEx(
+            winreg.HKEY_CURRENT_USER,
+            REG_PATH,
+            0,
+            winreg.KEY_SET_VALUE
+        ):
+            pass
+
+    def get_registry_state(self):
+        state = {}
+
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                REG_PATH,
+                0,
+                winreg.KEY_READ
+            ) as key:
+                index = 0
+
+                while True:
+                    try:
+                        name, value, value_type = winreg.EnumValue(
+                            key, index
+                        )
+                        state[name] = {
+                            "value": value,
+                            "type": value_type
+                        }
+                        index += 1
+                    except OSError:
+                        break
+
+        except FileNotFoundError:
+            pass
+
+        return state
+
+    def write_log(self, event):
+        LOG_DIR.mkdir(exist_ok=True)
+
+        record = {
+            "timestamp": datetime.now().isoformat(),
+            "registry_path": "HKCU\\" + REG_PATH,
+            **event
+        }
+
+        with open(LOG_FILE, "a", encoding="utf-8") as file:
+            file.write(json.dumps(record) + "\n")
 
     def append_output(self, text):
         self.output.configure(state="normal")
@@ -62,73 +164,167 @@ class RegistryMonitorApp:
         self.output.configure(state="disabled")
 
     def start_monitoring(self):
-        if not WATCHER.exists():
-            messagebox.showerror(
-                "File not found",
-                "autorun_watch.py was not found in the project folder."
-            )
+        if self.running:
             return
 
-        try:
-            self.process = subprocess.Popen(
-                [sys.executable, "-u", str(WATCHER)],
-                cwd=str(PROJECT_DIR),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace"
-            )
-        except OSError as exc:
-            messagebox.showerror("Could not start", str(exc))
-            return
+        self.previous_state = self.get_registry_state()
+        self.stop_event.clear()
+        self.running = True
 
         self.start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
-        self.status.set("Status: Starting")
-        threading.Thread(
-            target=self.read_process,
-            daemon=True
-        ).start()
+        self.status.set("Status: Monitoring")
 
-    def read_process(self):
-        process = self.process
-        if process is None or process.stdout is None:
-            return
-
-        for line in process.stdout:
-            self.output_queue.put(line)
-
-        process.wait()
-        self.output_queue.put(
-            f"\nWatcher exited with code {process.returncode}.\n"
+        self.append_output(
+            "\nMonitoring started. Polling every 2 seconds.\n"
         )
+
+        self.monitor_thread = threading.Thread(
+            target=self.monitor_registry,
+            daemon=True
+        )
+        self.monitor_thread.start()
+
+    def monitor_registry(self):
+        while not self.stop_event.is_set():
+            try:
+                current_state = self.get_registry_state()
+
+                old_names = set(self.previous_state)
+                new_names = set(current_state)
+
+                for name in new_names - old_names:
+                    self.report_change(
+                        "ADDED", name, None,
+                        current_state[name]["value"]
+                    )
+
+                for name in old_names - new_names:
+                    self.report_change(
+                        "DELETED", name,
+                        self.previous_state[name]["value"], None
+                    )
+
+                for name in old_names & new_names:
+                    old_value = self.previous_state[name]["value"]
+                    new_value = current_state[name]["value"]
+
+                    if old_value != new_value:
+                        self.report_change(
+                            "MODIFIED", name, old_value, new_value
+                        )
+
+                self.previous_state = current_state
+
+            except Exception as error:
+                self.output_queue.put(
+                    f"Monitoring error: {error}\n"
+                )
+
+            self.stop_event.wait(POLL_INTERVAL)
+
         self.output_queue.put("__STOPPED__")
+
+    def report_change(self, action, name, old_value, new_value):
+        event = {
+            "action": action,
+            "value_name": name,
+            "old_value": old_value,
+            "new_value": new_value
+        }
+
+        try:
+            self.write_log(event)
+        except OSError as error:
+            self.output_queue.put(f"Log error: {error}\n")
+
+        self.output_queue.put(
+            f"{action}: {name} | Old: {old_value} | New: {new_value}\n"
+        )
+
+    def add_test_value(self):
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                REG_PATH,
+                0,
+                winreg.KEY_SET_VALUE
+            ) as key:
+                winreg.SetValueEx(
+                    key, TEST_VALUE, 0,
+                    winreg.REG_SZ, "Initial Test Value"
+                )
+
+            self.append_output(
+                "Test value created/updated: " + TEST_VALUE + "\n"
+            )
+
+        except OSError as error:
+            messagebox.showerror("Registry Error", str(error))
+
+    def modify_test_value(self):
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                REG_PATH,
+                0,
+                winreg.KEY_SET_VALUE
+            ) as key:
+                winreg.SetValueEx(
+                    key, TEST_VALUE, 0,
+                    winreg.REG_SZ, "Modified Test Value"
+                )
+
+            self.append_output(
+                "Test value modification requested.\n"
+            )
+
+        except OSError as error:
+            messagebox.showerror("Registry Error", str(error))
+
+    def delete_test_value(self):
+        try:
+            with winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                REG_PATH,
+                0,
+                winreg.KEY_SET_VALUE
+            ) as key:
+                winreg.DeleteValue(key, TEST_VALUE)
+
+            self.append_output(
+                "Test value deletion requested.\n"
+            )
+
+        except FileNotFoundError:
+            messagebox.showinfo(
+                "Not Found", "DemoTest does not exist."
+            )
+        except OSError as error:
+            messagebox.showerror("Registry Error", str(error))
+
+    def stop_monitoring(self):
+        if self.running:
+            self.stop_event.set()
+            self.status.set("Status: Stopping...")
 
     def read_output(self):
         while not self.output_queue.empty():
-            line = self.output_queue.get()
+            item = self.output_queue.get()
 
-            if line == "__STOPPED__":
-                self.process = None
+            if item == "__STOPPED__":
+                self.running = False
                 self.start_button.configure(state="normal")
                 self.stop_button.configure(state="disabled")
                 self.status.set("Status: Stopped")
+                self.append_output("Monitoring stopped.\n")
             else:
-                self.append_output(line)
-                if "Monitoring every" in line:
-                    self.status.set("Status: Monitoring")
+                self.append_output(item)
 
         self.root.after(200, self.read_output)
 
-    def stop_monitoring(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
-            self.status.set("Status: Stopping...")
-
     def close_app(self):
-        if self.process and self.process.poll() is None:
-            self.process.terminate()
+        self.stop_event.set()
         self.root.destroy()
 
 
